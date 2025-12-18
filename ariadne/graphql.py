@@ -24,6 +24,18 @@ from graphql import (
 from graphql import (
     subscribe as _subscribe,
 )
+try:
+    from graphql import experimental_execute_incrementally
+    from graphql.execution import (
+        InitialIncrementalExecutionResult,
+        SubsequentIncrementalExecutionResult,
+    )
+    INCREMENTAL_EXECUTION_AVAILABLE = True
+except ImportError:
+    INCREMENTAL_EXECUTION_AVAILABLE = False
+    experimental_execute_incrementally = None
+    InitialIncrementalExecutionResult = None
+    SubsequentIncrementalExecutionResult = None
 from graphql.validation import specified_rules, validate
 from graphql.validation.rules import ASTValidationRule
 
@@ -43,6 +55,40 @@ from .types import (
     ValidationRules,
 )
 from .validation.introspection_disabled import IntrospectionDisabledRule
+
+
+def has_defer_or_stream_directives(document: DocumentNode) -> bool:
+    """Check if a GraphQL document contains @defer or @stream directives.
+    
+    Args:
+        document: The parsed GraphQL document AST.
+        
+    Returns:
+        True if the document contains @defer or @stream directives, False otherwise.
+    """
+    from graphql.language import DirectiveNode
+    from graphql.language.visitor import visit
+    
+    has_directive = False
+    
+    def visit_node(node):
+        nonlocal has_directive
+        if hasattr(node, "directives") and node.directives:
+            for directive in node.directives:
+                if isinstance(directive, DirectiveNode):
+                    directive_name = directive.name.value
+                    if directive_name in ("defer", "stream"):
+                        has_directive = True
+                        return False  # Stop visiting
+        return None
+    
+    visit(document, {
+        "Field": visit_node,
+        "FragmentSpread": visit_node,
+        "InlineFragment": visit_node,
+    })
+    
+    return has_directive
 
 
 def root_value_two_args_deprecated():  # TODO: remove in 0.20
@@ -203,22 +249,58 @@ async def graphql(
                 result_update = root_value
                 root_value = root_value.root_value
 
-            exec_result = execute(
-                schema,
-                document,
-                root_value=root_value,
-                context_value=context_value,
-                variable_values=variables,
-                operation_name=operation_name,
-                execution_context_class=execution_context_class,
-                middleware=extension_manager.as_middleware_manager(
-                    middleware, middleware_manager_class
-                ),
-                **kwargs,
+            # Check if we should use incremental execution for @defer/@stream
+            use_incremental = (
+                INCREMENTAL_EXECUTION_AVAILABLE
+                and experimental_execute_incrementally is not None
+                and has_defer_or_stream_directives(document)
             )
 
-            if isawaitable(exec_result):
-                exec_result = await cast(Awaitable[ExecutionResult], exec_result)
+            if use_incremental:
+                # Use incremental execution for @defer and @stream support
+                exec_result = experimental_execute_incrementally(
+                    schema,
+                    document,
+                    root_value=root_value,
+                    context_value=context_value,
+                    variable_values=variables,
+                    operation_name=operation_name,
+                    execution_context_class=execution_context_class,
+                    middleware=extension_manager.as_middleware_manager(
+                        middleware, middleware_manager_class
+                    ),
+                    **kwargs,
+                )
+                # experimental_execute_incrementally returns an async generator
+                if isawaitable(exec_result):
+                    exec_result = await cast(Awaitable[AsyncGenerator], exec_result)
+                # Return incremental results as async generator
+                return await handle_incremental_result(
+                    exec_result,
+                    logger=logger,
+                    error_formatter=error_formatter,
+                    debug=debug,
+                    extension_manager=extension_manager,
+                    result_update=result_update,
+                )
+            else:
+                # Use standard execution
+                exec_result = execute(
+                    schema,
+                    document,
+                    root_value=root_value,
+                    context_value=context_value,
+                    variable_values=variables,
+                    operation_name=operation_name,
+                    execution_context_class=execution_context_class,
+                    middleware=extension_manager.as_middleware_manager(
+                        middleware, middleware_manager_class
+                    ),
+                    **kwargs,
+                )
+
+                if isawaitable(exec_result):
+                    exec_result = await cast(Awaitable[ExecutionResult], exec_result)
         except GraphQLError as error:
             error_result = handle_graphql_errors(
                 [error],
@@ -577,6 +659,73 @@ async def subscribe(
             log_error(error_, logger)
         return False, [error_formatter(error, debug) for error in errors]
     return True, cast(AsyncGenerator, result)
+
+
+async def handle_incremental_result(
+    result_generator: AsyncGenerator,
+    *,
+    logger,
+    error_formatter,
+    debug,
+    extension_manager=None,
+    result_update=None,
+) -> GraphQLResult:
+    """Handle incremental execution results from experimental_execute_incrementally.
+    
+    Returns an async generator that yields formatted incremental results.
+    """
+    async def incremental_generator():
+        async for incremental_result in result_generator:
+            if INCREMENTAL_EXECUTION_AVAILABLE:
+                if isinstance(incremental_result, InitialIncrementalExecutionResult):
+                    # First result - initial data
+                    response = {"data": incremental_result.data}
+                    if incremental_result.errors:
+                        for error in incremental_result.errors:
+                            log_error(error, logger)
+                        response["errors"] = [
+                            error_formatter(error, debug) for error in incremental_result.errors
+                        ]
+                    
+                    if extension_manager:
+                        if incremental_result.errors:
+                            extension_manager.has_errors(incremental_result.errors)
+                        add_extensions_to_response(extension_manager, response)
+                    
+                    if result_update:
+                        response = result_update.update_result((True, response))[1]
+                    
+                    yield response
+                elif isinstance(incremental_result, SubsequentIncrementalExecutionResult):
+                    # Subsequent results - incremental patches
+                    patch = {}
+                    if incremental_result.incremental:
+                        for inc in incremental_result.incremental:
+                            if hasattr(inc, "data") and inc.data is not None:
+                                patch.update(inc.data)
+                            if hasattr(inc, "errors") and inc.errors:
+                                if "errors" not in patch:
+                                    patch["errors"] = []
+                                for error in inc.errors:
+                                    log_error(error, logger)
+                                    patch["errors"].append(error_formatter(error, debug))
+                    
+                    if patch:
+                        yield patch
+            else:
+                # Fallback if types are not available
+                if hasattr(incremental_result, "data"):
+                    response = {"data": incremental_result.data}
+                    if hasattr(incremental_result, "errors") and incremental_result.errors:
+                        for error in incremental_result.errors:
+                            log_error(error, logger)
+                        response["errors"] = [
+                            error_formatter(error, debug) for error in incremental_result.errors
+                        ]
+                    yield response
+    
+    # Return async generator as the second element
+    return True, incremental_generator()
 
 
 def handle_query_result(

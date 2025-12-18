@@ -76,9 +76,10 @@ It's a tuple of two elements:
 `bool`: `True` when query was executed successfully (without any errors), 
 `False` otherwise.
 
-`dict`: JSON-serializable query result.
+`dict`: JSON-serializable query result, or an async generator for incremental 
+execution results (when @defer/@stream directives are used).
 """
-GraphQLResult = tuple[bool, dict]
+GraphQLResult = tuple[bool, dict | AsyncGenerator[dict, None]]
 
 """Result type for `subscribe` function.
 

@@ -184,6 +184,12 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
             )
 
         success, result = await self.execute_graphql_query(request, data)
+        
+        # Check if result is an async generator (incremental execution)
+        from collections.abc import AsyncGenerator
+        if isinstance(result, AsyncGenerator):
+            return await self.create_multipart_response(request, result, success)
+        
         return await self.create_json_response(request, result, success)
 
     async def extract_data_from_request(self, request: Request) -> dict | list:
@@ -396,6 +402,50 @@ class GraphQLHTTPHandler(GraphQLHttpHandlerBase):
         if middleware:
             return cast(MiddlewareList, middleware)
         return None
+
+    async def create_multipart_response(
+        self,
+        request: Request,
+        result_generator: AsyncGenerator,
+        success: bool,
+    ) -> Response:
+        """Creates multipart response for incremental GraphQL execution results.
+
+        Returns a streaming response with multipart content type for @defer/@stream
+        directives. Each chunk contains a JSON-encoded incremental result.
+
+        Follows the GraphQL multipart response specification:
+        https://github.com/graphql/graphql-over-http/blob/main/rfcs/IncrementalDelivery.md
+
+        # Required arguments
+
+        `request`: the `Request` instance from Starlette or FastAPI.
+
+        `result_generator`: an async generator yielding incremental results.
+
+        `success`: a `bool` specifying if execution was successful.
+        """
+        from starlette.responses import StreamingResponse
+        
+        async def generate_multipart():
+            boundary = "---graphql"
+            async for chunk in result_generator:
+                chunk_json = json.dumps(chunk)
+                chunk_bytes = chunk_json.encode("utf-8")
+                yield f"--{boundary}\r\n".encode("utf-8")
+                yield f"Content-Type: application/json\r\n".encode("utf-8")
+                yield f"Content-Length: {len(chunk_bytes)}\r\n".encode("utf-8")
+                yield b"\r\n"
+                yield chunk_bytes
+                yield b"\r\n"
+            yield f"--{boundary}--\r\n".encode("utf-8")
+        
+        status_code = HTTPStatus.OK if success else HTTPStatus.BAD_REQUEST
+        return StreamingResponse(
+            generate_multipart(),
+            status_code=status_code,
+            media_type=f"multipart/mixed; boundary=---graphql",
+        )
 
     async def create_json_response(
         self,
